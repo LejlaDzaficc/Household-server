@@ -1,4 +1,7 @@
 #include <iostream>
+#include <boost/uuid/uuid.hpp>
+#include <boost/uuid/uuid_io.hpp>
+#include <boost/uuid/uuid_generators.hpp>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -17,10 +20,12 @@ extern const std::string getCurrentDateTime();
 extern void argument_error_handler(std::string message);
 extern void error_handler(std::string message);
 
-std::mutex mtx;
-const int numberOfPendingConections = 10;
 std::set<int> fdContainer;
 std::list<Household> households;
+std::mutex mtxFdContainer;
+std::mutex mtxHouseholds;
+
+const int numberOfPendingConections = 10;
 using json = nlohmann::json;
 
 int prepareServer(int port){
@@ -46,18 +51,22 @@ void closeConnection(int fd, fd_set *readFd_set){
   close(fd);
   if(readFd_set != nullptr)
     FD_CLR(fd, readFd_set);
-  std::lock_guard<std::mutex> lck{mtx};
+ 
+  std::unique_lock<std::mutex> lckFdContainer(mtxFdContainer);
   fdContainer.erase(fd);
+  std::string numberOfConnectedClients = "Number of connected clients: " + std::to_string(fdContainer.size()) + '\n';
+  lckFdContainer.unlock();
+  write(1, numberOfConnectedClients.c_str(), strlen(numberOfConnectedClients.c_str()));
+
+  std::lock_guard<std::mutex> lckHouseholds{mtxHouseholds};
   for(auto it = households.begin(); it!= households.end(); ++it)
     (*it).removeUser(fd);
-  std::string numberOfConnectedClients = "Number of connected clients: " + std::to_string(fdContainer.size()) + '\n';
-  write(1, numberOfConnectedClients.c_str(), strlen(numberOfConnectedClients.c_str()));
 }
 
 void handleChatMessage(json requestJson, int fd){
   std::string groupID = requestJson["groupID"];
   std::string message = requestJson.dump();
-  std::lock_guard<std::mutex> lck{mtx};
+  std::lock_guard<std::mutex> lck{mtxHouseholds};
   /* Send/forward message to other participants in household */
   for(auto it = households.begin(); it!= households.end(); ++it){
     if((*it).getID() == groupID){
@@ -68,24 +77,27 @@ void handleChatMessage(json requestJson, int fd){
       }
     }
   }
-  mtx.unlock();
-  write(1, message.c_str(), strlen(message.c_str()));
+}
+
+bool addUserToSpecificHousehold(std::string groupID, int fd){
+  std::lock_guard<std::mutex> lck{mtxHouseholds};
+  for(auto it = households.begin(); it!= households.end(); ++it){
+    if((*it).getID() == groupID){
+      User user = User();
+      user.setFd(fd);
+      (*it).addUser(user);
+      return true;
+    }
+  }
+  return false;
 }
 
 void handleJoinToHouseholdMessage(json requestJson, int fd){
   std::string groupID = requestJson["groupID"];
-  std::lock_guard<std::mutex> lck{mtx};
-  bool isGroupIDFound = false;
   json responseJson;
-  for(auto it = households.begin(); it!= households.end(); ++it){
-    if((*it).getID() == groupID){
-      isGroupIDFound = true;
-      User user = User();
-      user.setFd(fd);
-      (*it).addUser(user);
-    }
-  }
-  if(!isGroupIDFound){
+
+  bool isUserAdded = addUserToSpecificHousehold(groupID, fd);
+  if(!isUserAdded){
     responseJson["command"] = "joinToHousehold";
     responseJson["status"] = "rejected";
     responseJson["reason"] = "Household with given id does not exist!";
@@ -94,7 +106,35 @@ void handleJoinToHouseholdMessage(json requestJson, int fd){
     responseJson["command"] = "joinToHousehold";
     responseJson["status"] = "accepted";   
   }
-  mtx.unlock();
+  std::string message = responseJson.dump();
+  write(fd, message.c_str(), strlen(message.c_str()));
+}
+
+std::string generateGroupID(){
+  auto gen = boost::uuids::random_generator();
+  boost::uuids::uuid ID = gen();
+  return boost::uuids::to_string(ID);
+}
+
+void handleCreateNewHouseholdMessage(int fd){
+  std::string groupID = generateGroupID();
+  Household household = Household(groupID);
+  std::unique_lock<std::mutex> lck(mtxHouseholds);
+  households.push_back(household);
+  lck.unlock();
+  json responseJson;
+
+  bool isUserAdded = addUserToSpecificHousehold(groupID, fd);
+  if(!isUserAdded){
+    responseJson["command"] = "createNewHousehold";
+    responseJson["status"] = "rejected";
+    responseJson["reason"] = "Household could not been created!\nPlease try again later.";
+  }
+  else{
+    responseJson["command"] = "createNewHousehold";
+    responseJson["status"] = "accepted";  
+    responseJson["groupID"] = groupID;
+  }
   std::string message = responseJson.dump();
   write(fd, message.c_str(), strlen(message.c_str()));
 }
@@ -112,7 +152,9 @@ void handleNewMessage(int fd, fd_set *readFd_set = nullptr){
     buffer[readBytes] = '\0';
     auto requestJson = json::parse(std::string(buffer));
     std::string command = requestJson["command"];
-    if(command == "joinToHousehold")
+    if(command == "createNewHousehold")
+      handleCreateNewHouseholdMessage(fd);
+    else if(command == "joinToHousehold")
       handleJoinToHouseholdMessage(requestJson, fd);
     else if(command == "chatMessage")
       handleChatMessage(requestJson, fd);
@@ -120,8 +162,14 @@ void handleNewMessage(int fd, fd_set *readFd_set = nullptr){
 }
 
 void serveClient(int newClientFd){
-  while(fdContainer.find(newClientFd) != fdContainer.end())
+  while(1){
+    std::unique_lock<std::mutex> lck(mtxFdContainer);
+    bool isClientConnected = fdContainer.find(newClientFd) != fdContainer.end();
+    lck.unlock();
+    if(!isClientConnected)
+      break;
     handleNewMessage(newClientFd);
+  }
 }
 
 void handleConnections(int serverFd){
@@ -132,28 +180,23 @@ void handleConnections(int serverFd){
     if((newClientFd = accept(serverFd, (struct sockaddr *)&clientAddr, &size)) < 0)
       error_handler("Error in accept()!");
     std::string clientConnectedMessage = "NEW CLIENT CONNECTED!\n\tClient address: '" 
-      + std::string(inet_ntoa(clientAddr.sin_addr)) + ":" 
-      + std::to_string(ntohs(clientAddr.sin_port)) 
-      + "'\n\tTime: " + getCurrentDateTime().c_str() + "\n";
+          + std::string(inet_ntoa(clientAddr.sin_addr)) + ":" 
+          + std::to_string(ntohs(clientAddr.sin_port)) 
+          + "'\n\tTime: " + getCurrentDateTime().c_str() + "\n";
     write(1, clientConnectedMessage.c_str(), strlen(clientConnectedMessage.c_str()));
-    std::thread client{serveClient, newClientFd};
-    client.detach();
-    std::lock_guard<std::mutex> lck{mtx};
+    std::unique_lock<std::mutex> lck(mtxFdContainer);
     fdContainer.insert(newClientFd);
     std::string numberOfConnectedClients = "Number of connected clients: " + std::to_string(fdContainer.size()) + '\n';
-    mtx.unlock();
+    lck.unlock();
+   
+    std::thread client{serveClient, newClientFd};
+    client.detach();
     write(1, numberOfConnectedClients.c_str(), strlen(numberOfConnectedClients.c_str()));
   }
 }
 
 void runServer(int port){
   int serverFd = prepareServer(port);
-  /* Hardcoded to support only two households */
-  Household household1 = Household("1");
-  Household household2 = Household("2");
-  households.push_back(household1);
-  households.push_back(household2);
-
   handleConnections(serverFd);
 }
 
